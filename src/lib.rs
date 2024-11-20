@@ -1,186 +1,299 @@
-//! Support for the 8259 Programmable Interrupt Controller, which handles
-//! basic I/O interrupts.  In multicore mode, we would apparently need to
-//! replace this with an APIC interface.
-//!
-//! The basic idea here is that we have two PIC chips, PIC1 and PIC2, and
-//! that PIC2 is slaved to interrupt 2 on PIC 1.  You can find the whole
-//! story at http://wiki.osdev.org/PIC (as usual).  Basically, our
-//! immensely sophisticated modern chipset is engaging in early-80s
-//! cosplay, and our goal is to do the bare minimum required to get
-//! reasonable interrupts.
-//!
-//! The most important thing we need to do here is set the base "offset"
-//! for each of our two PICs, because by default, PIC1 has an offset of
-//! 0x8, which means that the I/O interrupts from PIC1 will overlap
-//! processor interrupts for things like "General Protection Fault".  Since
-//! interrupts 0x00 through 0x1F are reserved by the processor, we move the
-//! PIC1 interrupts to 0x20-0x27 and the PIC2 interrupts to 0x28-0x2F.  If
-//! we wanted to write a DOS emulator, we'd presumably need to choose
-//! different base interrupts, because DOS used interrupt 0x21 for system
-//! calls.
-
 #![no_std]
+//! Support for the 8259 Programmable Interrupt Controller, which handles basic I/O interrupts.  
+//! In multicore mode, we would apparently need to replace this with an APIC interface.
+//!
+//! A single PIC handles up to eight vectored priority interrupts for the CPU. By cascading 8259
+//! chips, we can increase interrupts up to 64 interrupt lines, however we only have two chained
+//! instances that can handle 16 lines. Can be programmed either in edge triggered, or in level
+//! triggered mode. PIC uses CHANNEL0 from the PIT (Programmable Interval Timer), which's frequency
+//! can be adjusted based on it's configuration. Individual bits of IRQ register within the PIC can
+//! be masked out by the software.
+//!
+//! The basic idea here is that we have two PIC chips, PIC1 and PIC2, and that PIC2 is slaved to 
+//! interrupt 2 on PIC 1. You can find the whole story at http://wiki.osdev.org/PIC (as usual).
 
-use x86_64::instructions::port::Port;
+mod commands;
+mod chip;
+mod regs;
+mod post;
 
-/// Command sent to begin PIC initialization.
-const CMD_INIT: u8 = 0x11;
+use commands::*;
+use chip::*;
 
-/// Command sent to acknowledge an interrupt.
-const CMD_END_OF_INTERRUPT: u8 = 0x20;
+pub use regs::*;
 
-// The mode in which we want to run our PICs.
-const MODE_8086: u8 = 0x01;
-
-/// An individual PIC chip.  This is not exported, because we always access
-/// it through `Pics` below.
-struct Pic {
-    /// The base offset to which our interrupts are mapped.
-    offset: u8,
-
-    /// The processor I/O port on which we send commands.
-    command: Port<u8>,
-
-    /// The processor I/O port on which we send and receive data.
-    data: Port<u8>,
+/// **Operation Mode for PIC Controller**.
+///
+/// PIC supports several operation mode, most of which are most likely to be ignored on x86
+/// architecture, however some of them can be used to obtain some interesting results. See more
+/// information for each of them below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PicOperationMode {
+    /// Fully Nested Mode (Default Mode)
+    ///
+    /// This mode is entered after intiialization unless another mode is programmed. The interrupt
+    /// requests are ordered in priority from 0 through 7, where 0 is the highest priority. When
+    /// interrupt is acknowledged the highest priority interrupt will be issued before the rest.
+    ///
+    /// On a regular x86 PC with two chained PICs, the IRQ0, which is an output of a PIT timer,
+    /// will be handled before others IRQ lines. Slave PIC has even smaller priority than first 7
+    /// masters IRQ lines, because it is mapped after the master PIC.
+    ///
+    /// # Use Case
+    ///
+    /// Use when the default priority level suits your needs. For example, if a PS/2 keyboard interrupt
+    /// (IRQ1) will be always services before the real time clock (IRQ8).
+    FullyNested,
+    /// Automatic Rotation Mode (Equal Priority Mode)
+    ///
+    /// Rotates the priority by the value specified in the current highest priority interrupt
+    /// within the ISR register. Basically each time the highest priority interrupt occur, it will 
+    /// then be defined as a lowest priority interrupt. This way giving all interrupt sources an
+    /// equal service time from the CPU.
+    ///
+    /// # Use Case
+    ///
+    /// Use if you think that all interrupts deserve to be handled equally. This sometimes might
+    /// cause troubles with timers, specifically the PIT and RTC.
+    AutomaticRotation,
+    /// Special Mask Mode (Manual Priority Mode)
+    ///
+    /// Some applications might want to have a different priority mapping for the full software
+    /// control over the sequence of interrupts. During this mode the mask register is now used to 
+    /// temporarly disable certain interrupt levels (not interrupt lines) as well as manually
+    /// changing the priority level.
+    ///
+    /// # Use Case
+    ///
+    /// Critical sections that wish to disable some interrupts from the PIC but not all of them, or
+    /// some applications with specific timing requirements that require to temporarly inhibit some
+    /// of interrupt levels to make sure that lower priority interrupts will meet timings accordigly.
+    SpecialMask,
+    /// Polled Mode (No interrupts)
+    ///
+    /// Do not use interrupts to obtain information from the peripherals but only listen for
+    /// upcoming changes. After the polled mode is enabled, data bus will provide a binary value of a
+    /// highest priority issued interrupt. Each read from the data port will be treated as an
+    /// interrupt acknowledge.
+    ///
+    /// # Use Case
+    ///
+    /// Probably the most useless one. Since it is very quick to turn this mode on and off, it can
+    /// be used to handle several interrupts in one handler by reading all values from the data
+    /// port until it will be equal to zero.
+    PolledMode,
 }
 
-impl Pic {
-    /// Are we in charge of handling the specified interrupt?
-    /// (Each PIC handles 8 interrupts.)
-    fn handles_interrupt(&self, interrupt_id: u8) -> bool {
-        self.offset <= interrupt_id && interrupt_id < self.offset + 8
-    }
-
-    /// Notify us that an interrupt has been handled and that we're ready
-    /// for more.
-    unsafe fn end_of_interrupt(&mut self) {
-        self.command.write(CMD_END_OF_INTERRUPT);
-    }
-
-    /// Reads the interrupt mask of this PIC.
-    unsafe fn read_mask(&mut self) -> u8 {
-        self.data.read()
-    }
-
-    /// Writes the interrupt mask of this PIC.
-    unsafe fn write_mask(&mut self, mask: u8) {
-        self.data.write(mask)
-    }
-}
-
-/// A pair of chained PICs.  This is the standard setup on x86.
+/// A x86 setup of **Chained PICs**.
+///
+/// In most PCs there are one master and one slace PIC configuration, each having 8 inputs
+/// servicing 16 interrupts. This structure allows to easily initialize and control the x86
+/// configuration of PICs and configure all 16 interrupts for further handling.
+///
+/// Provides a minimal set of functions required to properly handle interrupts based on the
+/// currently used mode for each PIC.
 pub struct ChainedPics {
-    pics: [Pic; 2],
+    initialized: bool,
+    pub master: Pic,
+    pub slave: Pic,
 }
 
 impl ChainedPics {
-    /// Create a new interface for the standard PIC1 and PIC2,
-    /// specifying the desired interrupt offsets.
-    pub const unsafe fn new(offset1: u8, offset2: u8) -> ChainedPics {
-        ChainedPics {
-            pics: [
-                Pic {
-                    offset: offset1,
-                    command: Port::new(0x20),
-                    data: Port::new(0x21),
-                },
-                Pic {
-                    offset: offset2,
-                    command: Port::new(0xA0),
-                    data: Port::new(0xA1),
-                },
-            ],
-        }
+    /// Creates a new instance of Chained Pics.
+    /// 
+    /// The master offset and slave offset are two offsets that are pointing to the first
+    /// interrupt vector of each 8259 chip.
+    /// 
+    /// # Panics
+    /// 
+    /// This function will panic if the provided offsets will overlap with each other or
+    /// collide with CPU exceptions.
+    pub const fn new(master_offset: u8, slave_offset: u8) -> Self {
+        assert!(master_offset >= 32 || slave_offset >= 32, "Both master and slave offsets must not overlap with CPU exceptions.");
+        assert!(master_offset.abs_diff(slave_offset) >= 8, "The master and slave offsets are overlapping with each other.");
+
+        unsafe { Self::new_unchecked(master_offset, slave_offset) }
     }
 
-    /// Create a new `ChainedPics` interface that will map the PICs contiguously starting at the given interrupt offset.
-    ///
+    /// Creates a new instance of a Chained Pics.
+    /// 
+    /// The offset must point to the the chosen 16 entries from the IDT that will be used 
+    /// for the software interrupts.
+    /// 
     /// This is a convenience function that maps the PIC1 and PIC2 to a
     /// contiguous set of interrupts. This function is equivalent to
     /// `Self::new(primary_offset, primary_offset + 8)`.
-    pub const unsafe fn new_contiguous(primary_offset: u8) -> ChainedPics {
+    ///
+    /// # Panics
+    /// 
+    /// This function will panic if the provided offset will overlap with cpu exceptions. It
+    /// will always prevent the overlapping between master and slave chips, because it makes
+    /// an offset for them sequentially.
+    pub const fn new_contiguous(primary_offset: u8) -> Self {
         Self::new(primary_offset, primary_offset + 8)
     }
 
-    /// Initialize both our PICs.  We initialize them together, at the same
-    /// time, because it's traditional to do so, and because I/O operations
-    /// might not be instantaneous on older processors.
-    pub unsafe fn initialize(&mut self) {
-        // We need to add a delay between writes to our PICs, especially on
-        // older motherboards.  But we don't necessarily have any kind of
-        // timers yet, because most of them require interrupts.  Various
-        // older versions of Linux and other PC operating systems have
-        // worked around this by writing garbage data to port 0x80, which
-        // allegedly takes long enough to make everything work on most
-        // hardware.  Here, `wait` is a closure.
-        let mut wait_port: Port<u8> = Port::new(0x80);
-        let mut wait = || wait_port.write(0);
+    /// Returns true if initialized at least once.
+    pub fn is_initialized(&self) -> bool {
+        self.initialized
+    }
 
-        // Save our original interrupt masks, because I'm too lazy to
-        // figure out reasonable values. We'll restore these when we're
-        // done.
-        let saved_masks = self.read_masks();
+    /// Initializes the PICs.
+    ///
+    /// This performs an initialization that is compatible with most x86 PC devices. Some archaic
+    /// devices may use only one PIC. For such possibilities a manual initialization of PIC
+    /// structures must be performed.
+    ///
+    /// # Automatic Interrupts (Both Chips)
+    ///
+    /// With this flag enabled PIC will automatically perform a EOI operation at the trailing edge of the
+    /// last interrupt acknowledge pulse from the CPU. This setting can only be used with a single
+    /// master chip. Basically that means that the end of interrupt command is not necessary after
+    /// a corresponding handler function handles the interrupt, however it does not work well with
+    /// chained PICs.
+    pub fn initialize(&mut self, automatic_interrupts: bool) {
+        unsafe {
+            self.master.init(
+                PicIRQMapping::Master(Some(ICW3_MASTER::SLAVE2)), 
+                automatic_interrupts,
+            );
+            self.slave.init(
+                PicIRQMapping::Slave(ICW3_SLAVE::MASTER2), 
+                automatic_interrupts,
+            );
+        }
+        if !self.is_initialized() { self.initialized = true }
+    }
 
-        // Tell each PIC that we're going to send it a three-byte
-        // initialization sequence on its data port.
-        self.pics[0].command.write(CMD_INIT);
-        wait();
-        self.pics[1].command.write(CMD_INIT);
-        wait();
+    /// Disable both PICs interrupts.
+    ///
+    /// # Note
+    ///
+    /// This must be used when switching to APIC controller for handling interrupts. This is also
+    /// mandatory even if the chip was never initialized by the OS.
+    pub fn disable(&mut self) {
+        unsafe { self.write_mask(IrqMask::all()) };
+    }
 
-        // Byte 1: Set up our base offsets.
-        self.pics[0].data.write(self.pics[0].offset);
-        wait();
-        self.pics[1].data.write(self.pics[1].offset);
-        wait();
+    /// Gets the current IRQ mask.
+    pub fn get_mask(&mut self) -> IrqMask {
+        IrqMask::from_bits_truncate(
+            u16::from_le_bytes([
+                self.master.mask_read().bits(), self.slave.mask_read().bits()]
+            )
+        )
+    }
 
-        // Byte 2: Configure chaining between PIC1 and PIC2.
-        self.pics[0].data.write(4);
-        wait();
-        self.pics[1].data.write(2);
-        wait();
+    /// Masks the IRQ lines of chained PICs.
+    ///
+    /// # Unsafe
+    ///
+    /// Even though masking just disabled some interrupt lines, this function is masked as unsafe
+    /// due to undefined behavior that might happen when the OCW1 command is not right.
+    pub unsafe fn write_mask(&mut self, mask: IrqMask) {
+        let bytes = mask.bits().to_le_bytes();
+        unsafe {
+            self.master.mask_write(OCW1::from_bits_truncate(bytes[0]));
+            self.slave.mask_write(OCW1::from_bits_truncate(bytes[1]));
+        }
+    }
 
-        // Byte 3: Set our mode.
-        self.pics[0].data.write(MODE_8086);
-        wait();
-        self.pics[1].data.write(MODE_8086);
-        wait();
-
-        // Restore our saved masks.
-        self.write_masks(saved_masks[0], saved_masks[1])
+    /// Creates a new instance of PIC controller.
+    /// 
+    /// The master offset and slave offset are two offsets that are pointing to the first
+    /// interrupt vector of each 8259 chip.
+    /// 
+    /// # Unsafe
+    /// 
+    /// This function will not check if the chosen offsets overlap with each other or do they
+    /// overlap with CPU exceptions.
+    pub const unsafe fn new_unchecked(master_offset: u8, slave_offset: u8) -> Self {
+        Self {
+            initialized: false,
+            master: Pic::new(master_offset, 0x20, 0x21),
+            slave: Pic::new(slave_offset, 0xa0, 0xa1),
+        }
     }
 
     /// Reads the interrupt masks of both PICs.
+    #[deprecated(since = "1.0.0", note = "Use [´get_mask´] to get a convenient 16-bit [´IrqMask´] structure instead.")]
     pub unsafe fn read_masks(&mut self) -> [u8; 2] {
-        [self.pics[0].read_mask(), self.pics[1].read_mask()]
+        [self.master.mask_read().bits(), self.slave.mask_read().bits()]
     }
-
+    
     /// Writes the interrupt masks of both PICs.
+    #[deprecated(since = "1.0.0", note = "Use [´set_mask´] to apply the mask conveniently via [´IrqMask´] structure.")]
     pub unsafe fn write_masks(&mut self, mask1: u8, mask2: u8) {
-        self.pics[0].write_mask(mask1);
-        self.pics[1].write_mask(mask2);
+        self.master.mask_write(OCW1::from_bits_truncate(mask1));
+        self.slave.mask_write(OCW1::from_bits_truncate(mask2));
     }
+}
 
-    /// Disables both PICs by masking all interrupts.
-    pub unsafe fn disable(&mut self) {
-        self.write_masks(u8::MAX, u8::MAX)
-    }
+bitflags::bitflags! {
+    /// IRQ Flags for 16 PIC Interrupts.
+    ///
+    /// These represent the 16 possible IRQ lines that the PIC can handle. Each line corresponds to a specific hardware 
+    /// interrupt source.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct IrqMask: u16 {
+        /// **IRQ0** - System timer interrupt.
+        /// Triggered by the system timer (PIT). Essential for task switching and system ticks.
+        const IRQ0_TIMER = 1 << 0;
 
-    /// Do we handle this interrupt?
-    pub fn handles_interrupt(&self, interrupt_id: u8) -> bool {
-        self.pics.iter().any(|p| p.handles_interrupt(interrupt_id))
-    }
+        /// **IRQ1** - PS/2 Keyboard interrupt.
+        /// Generated when a key is pressed or released on the primary keyboard.
+        const IRQ1_PS2_KEYBOARD = 1 << 1;
 
-    /// Figure out which (if any) PICs in our chain need to know about this
-    /// interrupt.  This is tricky, because all interrupts from `pics[1]`
-    /// get chained through `pics[0]`.
-    pub unsafe fn notify_end_of_interrupt(&mut self, interrupt_id: u8) {
-        if self.handles_interrupt(interrupt_id) {
-            if self.pics[1].handles_interrupt(interrupt_id) {
-                self.pics[1].end_of_interrupt();
-            }
-            self.pics[0].end_of_interrupt();
-        }
+        /// **IRQ3** - Serial port 2 (COM2) interrupt.
+        /// Triggered by activity on the second serial port.
+        const IRQ3_SERIAL_PORT2 = 1 << 3;
+
+        /// **IRQ4** - Serial port 1 (COM1) interrupt.
+        /// Triggered by activity on the first serial port.
+        const IRQ4_SERIAL_PORT1 = 1 << 4;
+
+        /// **IRQ5** - Parallel port 2 interrupt (or sound card).
+        /// Often used for parallel port 2, but may be reassigned to other devices like a sound card.
+        const IRQ5_PARALLEL_PORT2 = 1 << 5;
+
+        /// **IRQ6** - Diskette drive (floppy disk controller) interrupt.
+        /// Used for floppy disk read/write operations.
+        const IRQ6_DISKETTE_DRIVE = 1 << 6;
+
+        /// **IRQ7** - Parallel port 1 interrupt.
+        /// Commonly associated with parallel port 1, typically used for printers.
+        const IRQ7_PARALLEL_PORT1 = 1 << 7;
+
+        /// **IRQ8** - Real-Time Clock (RTC) interrupt.
+        /// Generated by the RTC for timekeeping purposes.
+        const IRQ8_RTC = 1 << 8;
+
+        /// **IRQ9** - CGA vertical retrace interrupt (or general use).
+        /// Historically used for CGA video cards. Now typically available for general-purpose use.
+        const IRQ9_CGA_VERTICAL_RETRACE = 1 << 9;
+
+        /// **IRQ10** - Free for general-purpose use (first available line).
+        /// Not assigned to specific hardware by default.
+        const IRQ10_FREE_1 = 1 << 10;
+
+        /// **IRQ11** - Free for general-purpose use (second available line).
+        /// Not assigned to specific hardware by default.
+        const IRQ11_FREE_2 = 1 << 11;
+
+        /// **IRQ12** - PS/2 Mouse interrupt.
+        /// Triggered by activity on the PS/2 mouse.
+        const IRQ12_PS2_MOUSE = 1 << 12;
+
+        /// **IRQ13** - Floating Point Unit (FPU) interrupt.
+        /// Used for floating-point arithmetic errors or related conditions.
+        const IRQ13_FPU = 1 << 13;
+
+        /// **IRQ14** - Primary ATA channel interrupt.
+        /// Handles interrupts from devices on the primary ATA (IDE) bus, such as the main hard drive.
+        const IRQ14_PRIMARY_ATA = 1 << 14;
+
+        /// **IRQ15** - Secondary ATA channel interrupt.
+        /// Handles interrupts from devices on the secondary ATA (IDE) bus, such as additional drives.
+        const IRQ15_SECONDARY_ATA = 1 << 15;
     }
 }
