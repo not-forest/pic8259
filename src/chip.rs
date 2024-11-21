@@ -4,6 +4,7 @@
 //! [´ChainedPics´] for convenient structure to manipulate on chained set of PICs located on the
 //! x86 architecture.
 
+use core::ops::Not;
 use x86_64::instructions::port::Port;
 use crate::post::post_debug_delay;
 use crate::*;
@@ -40,7 +41,7 @@ pub enum PicIRQMapping {
 #[derive(Debug)]
 pub struct Pic {
     /// The base offset to which our interrupts are mapped.
-    offset: u8,
+    pub offset: u8,
     /// Current operation mode for this specific PIC.
     op_mode: PicOperationMode,
     /// Automatic EOI flags.
@@ -160,10 +161,11 @@ impl Pic {
         }
     }
 
-    /// Are we in charge of handling the specified interrupt?
-    /// (Each PIC handles 8 interrupts.)
+    /// Checks if the provided IRQ id from the IDT matches this PIC.
+    ///
+    /// Each PIC may only handle up to 8 interrupts.
     pub fn handles_interrupt(&self, interrupt_id: u8) -> bool {
-        self.offset <= interrupt_id && interrupt_id < self.offset + 8
+        (self.offset..self.offset + 1).contains(&interrupt_id)
     }
 
     /// Reads the value of current operation mode used on this PIC.
@@ -186,12 +188,33 @@ impl Pic {
                         } else {
                             OCW2::ROTATE_ON_NON_SPECIFIC_EOI_COMMAND.bits()
                         },
-                    PicOperationMode::SpecialMask => OCW3::SET_SPECIAL_MASK.bits(),
+                    PicOperationMode::SpecialMask(_) => OCW3::SET_SPECIAL_MASK.bits(),
                     PicOperationMode::PolledMode => OCW3::POLL.bits(),
                 });
             };
             self.op_mode = new_op_mode;
         }
+    }
+
+    /// Checks if the provided interrupt vector was caused by PIC properly.
+    ///
+    /// When an IRQ occurs, the PIC chip tells the CPU (via. the PIC's INTR line) that there's an interrupt, 
+    /// and the CPU acknowledges this and waits for the PIC to send the interrupt vector. This creates a race 
+    /// condition: if the IRQ disappears after the PIC has told the CPU there's an interrupt but before the 
+    /// PIC has sent the interrupt vector to the CPU, then the CPU will be waiting for the PIC to tell it 
+    /// which interrupt vector but the PIC won't have a valid interrupt vector to tell the CPU.
+    ///
+    /// Basically if the ISR bit for this flag is not set, but the interrupt service routine was
+    /// executed, that means it is spurious and interrupt must end right away. 
+    ///
+    /// # Unsafe 
+    ///
+    /// This function is only unsafe as it shall be only used within the interrupt handler function
+    /// at the very start, to make sure that we are not handling a spurious interrupt. It is
+    /// completely forbidden to send an end of interrupt after this function. 
+    pub unsafe fn is_spurious(&mut self, id: u8) -> bool {
+        let irq = ISR::from_bits_truncate(id);
+        self.read_isr().not().contains(irq)
     }
 
     /// Reads the value of the ISR.
@@ -233,9 +256,14 @@ impl Pic {
     ///
     /// Sends the OCW1 command and masks unused IRQ lines.
     ///
+    /// # Huge Warn
+    ///
+    /// On special mask mode, this inhibits the priority level, not masks the interrupts
+    /// completely. See more info in [´PicOperationMode::SpecialMask´]
+    ///
     /// # Unsafe
     ///
-    /// Even though masking just disabled some interrupt lines, this function is masked as unsafe
+    /// Even though masking just disabled some interrupt lines, this function is marked as unsafe
     /// due to undefined behavior that might happen when the OCW1 command is not right.
     pub unsafe fn mask_write(&mut self, ocw1: OCW1) {
         self.data.write(ocw1.bits());
@@ -243,13 +271,18 @@ impl Pic {
 
     /// Sends a proper end of interrupt.
     ///
+    /// # Special Mask
+    ///
+    /// Before calling this function a special mask can be used with the enum to inhibit the
+    /// interrupt priority. See more info in [´PicOperationMode::SpecialMask´]
+    ///
     /// # Note
     ///
     /// Does nothing if PIC is configured with automatic EOI flag.
     pub fn end_of_interrupt(&mut self) {
         match self.op_mode {
             PicOperationMode::FullyNested => unsafe { self.non_specified_eoi() },
-            PicOperationMode::SpecialMask => unimplemented!(),
+            PicOperationMode::SpecialMask(_) => todo!("Special mask mode"), // TODO!!
             _ => (),
         }
     }
@@ -279,4 +312,3 @@ impl Pic {
         );
     }
 }
-
