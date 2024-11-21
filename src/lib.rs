@@ -17,10 +17,12 @@ mod chip;
 mod regs;
 mod post;
 
+use bitflags::Flags;
 use commands::*;
 use chip::*;
 
 pub use regs::*;
+use x86_64::structures::idt::InterruptStackFrame;
 
 /// **Operation Mode for PIC Controller**.
 ///
@@ -68,7 +70,7 @@ pub enum PicOperationMode {
     /// Critical sections that wish to disable some interrupts from the PIC but not all of them, or
     /// some applications with specific timing requirements that require to temporarly inhibit some
     /// of interrupt levels to make sure that lower priority interrupts will meet timings accordigly.
-    SpecialMask,
+    SpecialMask(IrqMask),
     /// Polled Mode (No interrupts)
     ///
     /// Do not use interrupts to obtain information from the peripherals but only listen for
@@ -165,6 +167,85 @@ impl ChainedPics {
         if !self.is_initialized() { self.initialized = true }
     }
 
+    /// Checks if the provided interrupt vector was caused by PIC properly.
+    ///
+    /// When an IRQ occurs, the PIC chip tells the CPU (via. the PIC's INTR line) that there's an interrupt, 
+    /// and the CPU acknowledges this and waits for the PIC to send the interrupt vector. This creates a race 
+    /// condition: if the IRQ disappears after the PIC has told the CPU there's an interrupt but before the 
+    /// PIC has sent the interrupt vector to the CPU, then the CPU will be waiting for the PIC to tell it 
+    /// which interrupt vector but the PIC won't have a valid interrupt vector to tell the CPU.
+    ///
+    /// Here we read if the interrupt is written within the ISR register, to be sure that we are
+    /// dealing with real interrupt. If a spurious interrupt was also sent from the slave PIC, the
+    /// master shall clear this flag, because he also thinks that it was a legit IRQ.
+    ///
+    /// # Important
+    ///
+    /// This is also the reason why sometimes an unimplemented handler functions are causing general protection 
+    /// faults. PIC will cause an interrupt on the lowest priority IRQ, and the interrupt service
+    /// routine for something like hard disk controller is most likely not implemented in the stage
+    /// of configuring PICs.
+    ///
+    /// # Note (Fully Nested Mode)
+    ///
+    /// Spurious interrupts can only happen when the lowest priority IRQ are called. The fake interrupt number 
+    /// is the lowest priority interrupt number for the corresponding PIC chip (IRQ 7 for the master PIC, and 
+    /// IRQ 15 for the slave PIC).
+    ///
+    /// **Basically this means that you shall only check for spurious IRQs when it is a parallel
+    /// port interrupt (IRQ7) or secondary ATA channel interrupt (IRQ15)**
+    ///
+    /// # Note (Rotations)
+    ///
+    /// When modes with rotations are used: [´PicOperationMode::AutomaticRotation´],
+    /// [´PicOperationMode::SpecialMask´], the lowest priority priority IRQ is changed in time. For
+    /// such configurations, calling this function on every interrupt caused by PIC is probably
+    /// fine.
+    ///
+    /// # Unsafe 
+    ///
+    /// This function is only unsafe as it shall be only used within the interrupt handler function
+    /// at the very start, to make sure that we are not handling a spurious interrupt. It is
+    /// completely forbidden to send an end of interrupt after this function. 
+    pub unsafe fn is_spurious(&mut self, vec_id: u8) -> bool {
+        if self.slave.is_spurious(vec_id) { self.master.end_of_interrupt(); true } 
+        else if self.master.is_spurious(vec_id) { true } 
+        else { false }
+    }
+
+    /// Notify a proper PIC chip that the interrupt was succesfully handled and shall be cleared
+    /// within the ISR register.
+    ///
+    /// # Important
+    ///
+    /// To prevent spurious interrupts on lowest priority IRQs, use [´ChainedPics::is_spurious´]
+    /// and jump to the end of interrupt handler function if it returns true. If some interrupt was
+    /// caused by a hardware|software mistake, it should not be handled.
+    ///
+    /// **PIC must not receive a EOI command, when it is a spurious interrupts. It will prevent
+    /// other interrupts from being handled, which is a bigger trouble.**
+    ///
+    /// Lower priority interrupts vary based on the current mode. The function mentioned above
+    /// handles all logic required for each.
+    ///
+    /// # Unsafe 
+    ///
+    /// This command must be used at the end of every interrupt that was issued by any of two PICs.
+    /// Make sure that this is a last command withon the interrupt service routine.
+    ///
+    /// # Note
+    ///
+    /// Does nothing on chips with automatic interrupts flag enabled. See more in [´Pic´]
+    pub unsafe fn notify_end_of_interrupt(&mut self, vec_id: u8) {
+        if self.slave.handles_interrupt(vec_id) {
+            self.slave.end_of_interrupt();
+            self.master.end_of_interrupt();
+        } else
+        if self.master.handles_interrupt(vec_id) {
+            self.master.end_of_interrupt();
+        }
+    }
+
     /// Disable both PICs interrupts.
     ///
     /// # Note
@@ -179,8 +260,8 @@ impl ChainedPics {
     pub fn get_mask(&mut self) -> IrqMask {
         IrqMask::from_bits_truncate(
             u16::from_le_bytes([
-                self.master.mask_read().bits(), self.slave.mask_read().bits()]
-            )
+                self.master.mask_read().bits(), self.slave.mask_read().bits()
+            ])
         )
     }
 
@@ -188,7 +269,7 @@ impl ChainedPics {
     ///
     /// # Unsafe
     ///
-    /// Even though masking just disabled some interrupt lines, this function is masked as unsafe
+    /// Even though masking just disabled some interrupt lines, this function is marked as unsafe
     /// due to undefined behavior that might happen when the OCW1 command is not right.
     pub unsafe fn write_mask(&mut self, mask: IrqMask) {
         let bytes = mask.bits().to_le_bytes();
