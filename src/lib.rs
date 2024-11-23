@@ -11,18 +11,54 @@
 //!
 //! The basic idea here is that we have two PIC chips, PIC1 and PIC2, and that PIC2 is slaved to 
 //! interrupt 2 on PIC 1. You can find the whole story at http://wiki.osdev.org/PIC (as usual).
+//!
+//! # Typical Application.
+//!
+//! ```
+//! // Somewhere alongside other statics...
+//! use pic8259::ChainedPics;
+//! use spin::Mutex;
+//! pub static PROGRAMMABLE_INTERRUPT_CONTROLLER: Mutex<Option<ChainedPics>> = Mutex::new(None);
+//! ```
+//! # Fully nested
+//! ```
+//! ...
+//! // Somewhere in the OS initialization...
+//! 
+//! /* Memory init code, IDT and stuff... */
+//!
+//! let mut pic = ChainedPics::new_contiguous(32); // i.e IRQ0 => interrupt vector 32.
+//! pic.initialize();
+//!
+//! PROGRAMMABLE_INTERRUPT_CONTROLLER.lock().replace(pic);
+//! /* Here we can enable interrupts freely :) */
+//!
+//! ...
+//! // Somewhere in interrupt handling module. 
+//! 
+//! #[no_mangle]
+//! unsafe extern "x86-interrupt" fn timer_interrupt_handler(mut stack_frame: InterruptStackFrame) {
+//!
+//!     /*
+//!      * Some interrupt handling logic and stuff.
+//!      *  */
+//!     
+//!     // Sending the EOI.
+//!     PROGRAMMABLE_INTERRUPT_CONTROLLER.lock().as_mut().map(|pic| {
+//!         pic.notify_end_of_interrupt(32)
+//!     });
+//! }
+//! ```
 
 mod commands;
 mod chip;
 mod regs;
 mod post;
 
-use bitflags::Flags;
 use commands::*;
 use chip::*;
 
 pub use regs::*;
-use x86_64::structures::idt::InterruptStackFrame;
 
 /// **Operation Mode for PIC Controller**.
 ///
@@ -70,7 +106,7 @@ pub enum PicOperationMode {
     /// Critical sections that wish to disable some interrupts from the PIC but not all of them, or
     /// some applications with specific timing requirements that require to temporarly inhibit some
     /// of interrupt levels to make sure that lower priority interrupts will meet timings accordigly.
-    SpecialMask(IrqMask),
+    SpecialMask,
     /// Polled Mode (No interrupts)
     ///
     /// Do not use interrupts to obtain information from the peripherals but only listen for
@@ -111,7 +147,7 @@ impl ChainedPics {
     /// This function will panic if the provided offsets will overlap with each other or
     /// collide with CPU exceptions.
     pub const fn new(master_offset: u8, slave_offset: u8) -> Self {
-        assert!(master_offset >= 32 || slave_offset >= 32, "Both master and slave offsets must not overlap with CPU exceptions.");
+        assert!(master_offset >= 32 && slave_offset >= 32, "Both master and slave offsets must not overlap with CPU exceptions.");
         assert!(master_offset.abs_diff(slave_offset) >= 8, "The master and slave offsets are overlapping with each other.");
 
         unsafe { Self::new_unchecked(master_offset, slave_offset) }
@@ -145,26 +181,25 @@ impl ChainedPics {
     /// This performs an initialization that is compatible with most x86 PC devices. Some archaic
     /// devices may use only one PIC. For such possibilities a manual initialization of PIC
     /// structures must be performed.
-    ///
-    /// # Automatic Interrupts (Both Chips)
-    ///
-    /// With this flag enabled PIC will automatically perform a EOI operation at the trailing edge of the
-    /// last interrupt acknowledge pulse from the CPU. This setting can only be used with a single
-    /// master chip. Basically that means that the end of interrupt command is not necessary after
-    /// a corresponding handler function handles the interrupt, however it does not work well with
-    /// chained PICs.
-    pub fn initialize(&mut self, automatic_interrupts: bool) {
+    pub fn initialize(&mut self) {
         unsafe {
-            self.master.init(
-                PicIRQMapping::Master(Some(ICW3_MASTER::SLAVE2)), 
-                automatic_interrupts,
-            );
-            self.slave.init(
-                PicIRQMapping::Slave(ICW3_SLAVE::MASTER2), 
-                automatic_interrupts,
-            );
+            self.master.init(PicIRQMapping::Master(Some(ICW3_MASTER::SLAVE2)), false);
+            self.slave.init(PicIRQMapping::Slave(ICW3_SLAVE::MASTER2), false);
         }
         if !self.is_initialized() { self.initialized = true }
+    }
+
+
+    /// Changes the operation mode for both master and slave PICs.
+    ///
+    /// This sends the OCW2 command and configurest the current operation mode of the PIC logic.
+    /// Refer to [´PicOperationMode´] enum for more details. This function only checks the mode of
+    /// the master PIC, assuming that slave was not changed manually to something else.
+    pub fn operation_mode_change(&mut self, new_op_mode: PicOperationMode) {
+        if self.master.operation_mode_current() != new_op_mode {
+            self.master.operation_mode_change(new_op_mode);
+            self.slave.operation_mode_change(new_op_mode);
+        }
     }
 
     /// Checks if the provided interrupt vector was caused by PIC properly.
@@ -208,9 +243,16 @@ impl ChainedPics {
     /// at the very start, to make sure that we are not handling a spurious interrupt. It is
     /// completely forbidden to send an end of interrupt after this function. 
     pub unsafe fn is_spurious(&mut self, vec_id: u8) -> bool {
-        if self.slave.is_spurious(vec_id) { self.master.end_of_interrupt(); true } 
-        else if self.master.is_spurious(vec_id) { true } 
-        else { false }
+        assert!(vec_id >= 32, "Cannot be one of the CPU exceptions."); 
+
+        if self.slave.handles_interrupt(vec_id) {
+            if self.slave.is_spurious(vec_id) { 
+                self.master.end_of_interrupt(); 
+                true 
+            } else { false } 
+        } else if self.master.handles_interrupt(vec_id) { 
+            self.master.is_spurious(vec_id) 
+        } else { false }
     }
 
     /// Notify a proper PIC chip that the interrupt was succesfully handled and shall be cleared
@@ -232,11 +274,9 @@ impl ChainedPics {
     ///
     /// This command must be used at the end of every interrupt that was issued by any of two PICs.
     /// Make sure that this is a last command withon the interrupt service routine.
-    ///
-    /// # Note
-    ///
-    /// Does nothing on chips with automatic interrupts flag enabled. See more in [´Pic´]
     pub unsafe fn notify_end_of_interrupt(&mut self, vec_id: u8) {
+        assert!(vec_id >= 32, "Cannot be one of the CPU exceptions."); 
+
         if self.slave.handles_interrupt(vec_id) {
             self.slave.end_of_interrupt();
             self.master.end_of_interrupt();
