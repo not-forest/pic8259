@@ -4,6 +4,7 @@
 //! [´ChainedPics´] for convenient structure to manipulate on chained set of PICs located on the
 //! x86 architecture.
 
+use bitflags::Flags;
 use x86_64::instructions::port::Port;
 use crate::post::post_debug_delay;
 use crate::regs::*;
@@ -219,7 +220,7 @@ impl Pic {
     ///
     /// This function is only unsafe as it shall be only used within the interrupt handler function
     /// at the very start, to make sure that we are not handling a spurious interrupt. It is
-    /// completely forbidden to send an end of interrupt after this function. 
+    /// completely forbidden to send an EOI, if this function evaluates to true! 
     pub unsafe fn is_spurious(&mut self, id: u8) -> bool {
         assert!(id >= 32 && self.offset + 8 > id, "The provided interrupt vector is outside of scope of this PIC chip."); 
 
@@ -233,13 +234,12 @@ impl Pic {
     /// being serviced at that moment. The value will be flushed after the end_of_interrupt method.
     pub fn read_isr(&mut self) -> ISR {
         unsafe {
-            self.command.write(
-                (OCW3::READ_REG_ISR |
-                if self.op_mode == PicOperationMode::PolledMode {
-                    OCW3::POLL
-                } else { OCW3::empty() }).bits()
-            );
-            ISR::from_bits_truncate(self.command.read())
+            self.command.write(OCW3::READ_REG_ISR.bits());
+            let isr = ISR::from_bits_truncate(self.command.read());
+            if self.op_mode == PicOperationMode::PolledMode {
+                self.command.write(OCW3::POLL.bits())
+            }
+            isr
         }
     }
 
@@ -249,13 +249,12 @@ impl Pic {
     /// but are not being acknowledged yet. The value will be flushed after the end_of_interrupt method.
     pub fn read_irr(&mut self) -> IRR {
         unsafe {
-            self.command.write(
-                (OCW3::READ_REG_IRR |
-                if self.op_mode == PicOperationMode::PolledMode {
-                    OCW3::POLL
-                } else { OCW3::empty() }).bits()
-            );
-            IRR::from_bits_truncate(self.command.read())
+            self.command.write(OCW3::READ_REG_IRR.bits());
+            let irr = IRR::from_bits_truncate(self.command.read());
+            if self.op_mode == PicOperationMode::PolledMode {
+                self.command.write(OCW3::POLL.bits())
+            }
+            irr
         }
     }
 
@@ -275,15 +274,11 @@ impl Pic {
     ///
     /// # Note
     ///
-    /// The interrupt is immediately acknowledged after the first read.
+    /// The interrupt is immediately acknowledged after the first read. According to the datasheet:
+    /// When poll command is issued, the 8259 treats the next RD pulse as an interrupt acknowledge.
     pub fn poll(&mut self) -> Option<u8> {
         match self.op_mode {
-            PicOperationMode::PolledMode => unsafe { 
-                let irq = self.command.read();
-                // Acknowledge the IRQ right away.
-                self.specified_eoi(irq);
-                Some(irq) 
-            },
+            PicOperationMode::PolledMode => unsafe { Some(self.command.read()) },
             _ => None
         }
     }
@@ -317,10 +312,10 @@ impl Pic {
     /// Does nothing if PIC is configured with automatic EOI flag or in poll mode.
     pub fn end_of_interrupt(&mut self) {
         match self.op_mode {
-            PicOperationMode::SpecialMask => todo!("Special mask mode"), // TODO!!
+            PicOperationMode::FullyNested => unsafe { self.non_specified_eoi() },
             PicOperationMode::AutomaticRotation => unsafe { self.non_specified_eoi() },
-            PicOperationMode::PolledMode => (),
-            _ => unsafe { self.non_specified_eoi() },
+            PicOperationMode::SpecialMask => todo!("Special mask mode"), // TODO!!
+            PicOperationMode::PolledMode => (), // Interrupt is acknowledged once the command port is read.
         }
     }
 

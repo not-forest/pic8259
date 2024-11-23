@@ -233,13 +233,12 @@ impl ChainedPics {
     /// # Note (Rotations)
     ///
     /// When modes with rotations are used: [´PicOperationMode::AutomaticRotation´],
-    /// [´PicOperationMode::SpecialMask´], the lowest priority priority IRQ is changed in time. For
-    /// such configurations, calling this function on every interrupt caused by PIC is probably
-    /// fine.
+    /// [´PicOperationMode::SpecialMask´], the spurious interrupt can still only be found on IRQ7
+    /// for the master PIC or IRQ15 for the slave PIC.
     ///
     /// # Unsafe 
     ///
-    /// This function is only unsafe as it shall be only used within the interrupt handler function
+    /// This function is unsafe only because it shall be used within the interrupt handler function
     /// at the very start, to make sure that we are not handling a spurious interrupt. It is
     /// completely forbidden to send an end of interrupt after this function. 
     pub unsafe fn is_spurious(&mut self, vec_id: u8) -> bool {
