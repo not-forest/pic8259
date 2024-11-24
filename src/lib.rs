@@ -48,6 +48,28 @@
 //!         pic.notify_end_of_interrupt(32)
 //!     });
 //! }
+//! ...
+//!
+//! #[no_mangle]
+//! unsafe extern "x86-interrupt" fn parallel_port1_handler(mut stack_frame: InterruptStackFrame) {
+//!     let mut pic = PROGRAMMABLE_INTERRUPT_CONTROLLER.lock();
+//! 
+//!     // Checking if the interrupt was legit. (please look [´ChainedPics::is_spurious´])
+//!     if pic.as_mut().map(|pic| !pic.is_spurious(39)).unwrap_or(false) {
+//! 
+//!         /*  
+//!          * Some interrupt handling logic and stuff.
+//!          *  */
+//!         println!("The interrupt was legit!");
+//! 
+//!         // Sending the EOI.
+//!         pic.as_mut().map(|pic| {
+//!             pic.notify_end_of_interrupt(39)
+//!         });
+//!     } else {
+//!         println!("A spurious interrupt! Do not handle that!");
+//!     }
+//! }
 //! ```
 
 mod commands;
@@ -98,8 +120,7 @@ pub enum PicOperationMode {
     ///
     /// Some applications might want to have a different priority mapping for the full software
     /// control over the sequence of interrupts. During this mode the mask register is now used to 
-    /// temporarly disable certain interrupt levels (not interrupt lines) as well as manually
-    /// changing the priority level.
+    /// temporarly disable certain interrupt levels as well as manually changing the priority level.
     ///
     /// # Use Case
     ///
@@ -251,7 +272,9 @@ impl ChainedPics {
             } else { false } 
         } else if self.master.handles_interrupt(vec_id) { 
             self.master.is_spurious(vec_id) 
-        } else { false }
+        } else {
+            panic!("Provided interrupt is out of scope for both PICs.")
+        }
     }
 
     /// Notify a proper PIC chip that the interrupt was succesfully handled and shall be cleared
@@ -295,6 +318,37 @@ impl ChainedPics {
         unsafe { self.write_mask(IrqMask::all()) };
     }
 
+    /// Enables both PICs interrupts.
+    ///
+    /// They are enabled by default after the initialization.
+    ///
+    /// # Warn
+    ///
+    /// This is not the initialization. Please see [´ChainedPics::initialize´]
+    pub fn enable(&mut self) {
+        unsafe { self.write_mask(IrqMask::empty()); }
+    }
+
+    /// Disables the slave PIC fully, i.e IRQ8 ... IRQ15.
+    pub fn disable_slave(&mut self) {
+        unsafe {
+            let mask = self.master.mask_read();
+            self.master.mask_write(
+                mask | OCW1::MASK_IRQ_2
+            );
+        }
+    }
+
+    /// Enables the slave PIC, i.e IRQ8 ... IRQ15.
+    pub fn enable_slave(&mut self) {
+        unsafe {
+            let mask = self.master.mask_read();
+            self.master.mask_write(
+                mask & !OCW1::MASK_IRQ_2
+            );
+        }
+    }
+
     /// Gets the current IRQ mask.
     pub fn get_mask(&mut self) -> IrqMask {
         IrqMask::from_bits_truncate(
@@ -316,6 +370,19 @@ impl ChainedPics {
             self.master.mask_write(OCW1::from_bits_truncate(bytes[0]));
             self.slave.mask_write(OCW1::from_bits_truncate(bytes[1]));
         }
+    }
+
+    /// Perform something on the master PIC.
+    pub fn with_master<F>(&mut self, f: F) where
+        F: FnOnce(&mut Pic)
+    {
+        f(&mut self.master)
+    }
+
+    /// Perform something on the slave PIC.
+    pub fn with_slave<F>(&mut self, f: F) where
+        F: FnOnce(&mut Pic) {
+        f(&mut self.slave)
     }
 
     /// Creates a new instance of PIC controller.
