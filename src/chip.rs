@@ -272,11 +272,21 @@ impl Pic {
     /// Always 0x0 in polled mode.
     pub fn read_isr(&mut self) -> ISR {
         unsafe {
-            // ISR is guaranteed to be empty during in polled mode.
-            if self.op_mode == PicOperationMode::PolledMode { ISR::empty() } else {
-                self.command.write(OCW3::READ_REG_ISR.bits());
-                ISR::from_bits_truncate(self.command.read())
+            match self.op_mode {
+                // ISR is guaranteed to be empty during in polled mode.
+                PicOperationMode::PolledMode => return ISR::empty(),
+                PicOperationMode::SpecialMask => {
+                    self.command.write(
+                        OCW3::READ_REG_ISR.bits() | OCW3::SET_SPECIAL_MASK.bits()
+                    );
+                },
+                _ => {
+                    self.command.write(
+                        OCW3::READ_REG_ISR.bits()
+                    );
+                }
             }
+            ISR::from_bits_truncate(self.command.read())
         }
     }
 
@@ -286,13 +296,23 @@ impl Pic {
     /// but are not being acknowledged yet. The value will be flushed after the end_of_interrupt method.
     pub fn read_irr(&mut self) -> IRR {
         unsafe {
-            self.command.write(OCW3::READ_REG_IRR.bits());
-            let irr = IRR::from_bits_truncate(self.command.read());
-            // Polled mode will override the register read. The same goes vice-versa.
+            match self.op_mode {
+                PicOperationMode::SpecialMask => {
+                    self.command.write(
+                        OCW3::READ_REG_IRR.bits() | OCW3::SET_SPECIAL_MASK.bits()
+                    );
+                },
+                _ => {
+                    self.command.write(
+                        OCW3::READ_REG_IRR.bits()
+                    );
+
+                }
+            }
             if self.op_mode == PicOperationMode::PolledMode {
                 self.command.write(OCW3::POLL.bits())
             }
-            irr
+            IRR::from_bits_truncate(self.command.read())
         }
     }
 
