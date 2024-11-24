@@ -15,7 +15,8 @@ bitflags::bitflags! {
     /// the CPU acknowledges it.
     ///
     /// The interrupt request register shows the requested interrupts that have been raised
-    /// but are not being acknowledged yet. The value will be flushed after the end_of_interrupt method.
+    /// but are not being acknowledged yet. The highest priority value will be flushed after 
+    /// CPU enters the interrupt handler.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct IRR: u8 {
         const IRQ0 = 1;
@@ -30,9 +31,9 @@ bitflags::bitflags! {
         
     /// Read the Interrupt Service Register (ISR).    
     ///
-    /// Tracks IRQ line currently being services. Updated by EOI command.
-    /// The interrupt status register inside the PIC chip, shows the info about which interrupts are
-    /// being serviced at that moment. The value will be flushed after the end_of_interrupt method.
+    /// Tracks IRQ line currently being services. Updated by EOI command. The interrupt status register 
+    /// inside the PIC chip, shows the info about which interrupts are being serviced at that moment. 
+    /// The highest priority value will be flushed after the end_of_interrupt method.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct ISR: u8 {
         const IRQ0 = 1;

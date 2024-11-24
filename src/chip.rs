@@ -99,7 +99,7 @@ impl Pic {
     ///
     /// # PIC Mapping
     ///
-    /// This desides if the PIC is a master or a slave device. It also defines which lines are
+    /// This decides if the PIC is a master or a slave device. It also defines which lines are
     /// connected to which depending on it's value.
     ///
     /// # Automatic Interrupts
@@ -114,8 +114,8 @@ impl Pic {
     /// structure is not required within a single 8259A.
     pub unsafe fn init(&mut self, pic_map: PicIRQMapping, automatic_interrupts: bool) {
         unsafe {
-            // Saving the values that was before the data change.
-            let mask = self.data.read();
+            // Saving the previous irq masking.
+            let mask = self.mask_read();
             // Generating initialization commands based on the chosen operation mode.
             let icw1 = 
                 ICW1::IC4 | 
@@ -159,8 +159,8 @@ impl Pic {
             self.data.write(icw4.bits());
             post_debug_delay();
 
-            /* OCW1 command. */
-            self.data.write(mask);
+            // Restoring the mask.
+            self.mask_write(mask);
         }
     }
 
@@ -178,7 +178,7 @@ impl Pic {
 
     /// Changes the current operation mode of this PIC.
     ///
-    /// This sends the OCW2 command and configurest the current operation mode of the PIC logic.
+    /// This sends the OCW2 command and configures the current operation mode of the PIC logic.
     /// Refer to [´PicOperationMode´] enum for more details.
     ///
     /// # Warn.
@@ -236,6 +236,7 @@ impl Pic {
                 },
             }
         }
+        post_debug_delay(); 
         self.op_mode = new_op_mode;
     }
 
@@ -306,7 +307,6 @@ impl Pic {
                     self.command.write(
                         OCW3::READ_REG_IRR.bits()
                     );
-
                 }
             }
             if self.op_mode == PicOperationMode::PolledMode {
@@ -391,7 +391,7 @@ impl Pic {
     ///
     /// # Unsafe
     ///
-    /// A proper irq must be used, or new interrupts won't appear.
+    /// A proper IRQ must be used, or new interrupts won't appear.
     ///
     /// # Note
     ///

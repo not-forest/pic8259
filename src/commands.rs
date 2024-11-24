@@ -179,9 +179,6 @@ bitflags::bitflags! {
         const LEVEL = 0;
 
         /// Sets that the command is not EOI specific (i.e highest priority cleared first).
-        ///
-        /// # Note
-        /// This shall only be used in the fully nested mode.  
         const NON_SPECIFIC_EOI_COMMAND              = 0b001 << 5;
         /// Specific EOI command should be used.
         const SPECIFIC_EOI_COMMAND                  = 0b011 << 5;

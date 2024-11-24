@@ -5,9 +5,9 @@
 //! A single PIC handles up to eight vectored priority interrupts for the CPU. By cascading 8259
 //! chips, we can increase interrupts up to 64 interrupt lines, however we only have two chained
 //! instances that can handle 16 lines. Can be programmed either in edge triggered, or in level
-//! triggered mode. PIC uses CHANNEL0 from the PIT (Programmable Interval Timer), which's frequency
-//! can be adjusted based on it's configuration. Individual bits of IRQ register within the PIC can
-//! be masked out by the software.
+//! triggered mode. PIC uses CHANNEL0 from the PIT (Programmable Interval Timer), the frequency of
+//! which can be adjusted based on it's configuration. Individual bits of IRQ register within the 
+//! PIC can be masked out by the software.
 //!
 //! The basic idea here is that we have two PIC chips, PIC1 and PIC2, and that PIC2 is slaved to 
 //! interrupt 2 on PIC 1. You can find the whole story at http://wiki.osdev.org/PIC (as usual).
@@ -91,7 +91,7 @@ pub use regs::*;
 pub enum PicOperationMode {
     /// Fully Nested Mode (Default Mode)
     ///
-    /// This mode is entered after intiialization unless another mode is programmed. The interrupt
+    /// This mode is entered after initialization unless another mode is programmed. The interrupt
     /// requests are ordered in priority from 0 through 7, where 0 is the highest priority. When
     /// interrupt is acknowledged the highest priority interrupt will be issued before the rest.
     ///
@@ -186,8 +186,7 @@ impl ChainedPics {
     /// # Panics
     /// 
     /// This function will panic if the provided offset will overlap with cpu exceptions. It
-    /// will always prevent the overlapping between master and slave chips, because it makes
-    /// an offset for them sequentially.
+    /// will always prevent the overlapping between master and slave chips though
     pub const fn new_contiguous(primary_offset: u8) -> Self {
         Self::new(primary_offset, primary_offset + 8)
     }
@@ -201,7 +200,7 @@ impl ChainedPics {
     ///
     /// This performs an initialization that is compatible with most x86 PC devices. Some archaic
     /// devices may use only one PIC. For such possibilities a manual initialization of PIC
-    /// structures must be performed.
+    /// structure must be performed.
     pub fn initialize(&mut self) {
         unsafe {
             self.master.init(PicIRQMapping::Master(Some(ICW3_MASTER::SLAVE2)), false);
@@ -213,9 +212,13 @@ impl ChainedPics {
 
     /// Changes the operation mode for both master and slave PICs.
     ///
-    /// This sends the OCW2 command and configurest the current operation mode of the PIC logic.
+    /// This sends the OCW2 command and configures the current operation mode of the PIC logic.
     /// Refer to [´PicOperationMode´] enum for more details. This function only checks the mode of
     /// the master PIC, assuming that slave was not changed manually to something else.
+    ///
+    /// # Note
+    ///
+    /// The IRQ mask must be changed after switching from [´PicOperationMode::PolledMode´].
     pub fn operation_mode_change(&mut self, new_op_mode: PicOperationMode) {
         if self.master.operation_mode_current() != new_op_mode {
             self.master.operation_mode_change(new_op_mode);
@@ -257,6 +260,11 @@ impl ChainedPics {
     /// [´PicOperationMode::SpecialMask´], the spurious interrupt can still only be found on IRQ7
     /// for the master PIC or IRQ15 for the slave PIC.
     ///
+    /// # Note (Polled Mode)
+    ///
+    /// Makes no sense in polled mode. Note also that in polled mode the ISR is always zero, so
+    /// this function will always mark proper IRQs as spurious.
+    ///
     /// # Unsafe 
     ///
     /// This function is unsafe only because it shall be used within the interrupt handler function
@@ -284,10 +292,10 @@ impl ChainedPics {
     ///
     /// To prevent spurious interrupts on lowest priority IRQs, use [´ChainedPics::is_spurious´]
     /// and jump to the end of interrupt handler function if it returns true. If some interrupt was
-    /// caused by a hardware|software mistake, it should not be handled.
+    /// caused by a hardware|software error, it should not be handled.
     ///
-    /// **PIC must not receive a EOI command, when it is a spurious interrupts. It will prevent
-    /// other interrupts from being handled, which is a bigger trouble.**
+    /// **PIC must not receive a EOI command, when it is a spurious interrupts. It can clear
+    /// other interrupt's flag, which is a bigger trouble.**
     ///
     /// Lower priority interrupts vary based on the current mode. The function mentioned above
     /// handles all logic required for each.
@@ -312,8 +320,7 @@ impl ChainedPics {
     ///
     /// # Note
     ///
-    /// This must be used when switching to APIC controller for handling interrupts. This is also
-    /// mandatory even if the chip was never initialized by the OS.
+    /// This must be used when switching to APIC controller for handling interrupts.
     pub fn disable(&mut self) {
         unsafe { self.write_mask(IrqMask::all()) };
     }
