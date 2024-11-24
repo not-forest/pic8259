@@ -4,7 +4,6 @@
 //! [´ChainedPics´] for convenient structure to manipulate on chained set of PICs located on the
 //! x86 architecture.
 
-use bitflags::Flags;
 use x86_64::instructions::port::Port;
 use crate::post::post_debug_delay;
 use crate::regs::*;
@@ -181,28 +180,63 @@ impl Pic {
     ///
     /// This sends the OCW2 command and configurest the current operation mode of the PIC logic.
     /// Refer to [´PicOperationMode´] enum for more details.
+    ///
+    /// # Warn.
+    ///
+    /// When switching from polled mode a mask must be restored to the previously used one.
     pub fn operation_mode_change(&mut self, new_op_mode: PicOperationMode) {
-        if self.op_mode != new_op_mode {
-            unsafe {
-                match new_op_mode {
-                    PicOperationMode::FullyNested => {
-                        self.command.write(OCW2::ROTATE_IN_AUTOMATIC_EOI_MODE_CLEAR.bits());
-                    },
-                    PicOperationMode::AutomaticRotation => 
-                        if self.automatic_interrupts {
-                            self.command.write(OCW2::ROTATE_IN_AUTOMATIC_EOI_MODE_SET.bits());
-                        } else {
-                            self.command.write(OCW2::ROTATE_ON_NON_SPECIFIC_EOI_COMMAND.bits());
-                        },
-                    PicOperationMode::SpecialMask => self.command.write(OCW3::SET_SPECIAL_MASK.bits()),
-                    PicOperationMode::PolledMode => {
-                        self.mask_write(OCW1::all());
-                        self.command.write(OCW3::POLL.bits());
-                    },
+        use PicOperationMode::*;
+
+        unsafe {
+            /* Default behaviour when switching the mode. */
+            let fully_nested_arm = |s: &mut Self| // Restoring the disturbed fully nested structure. 
+                s.set_lowest_priority(7);
+            let automatic_rotation_arm = |s: &mut Self| 
+                if s.automatic_interrupts {
+                    s.command.write(OCW2::ROTATE_IN_AUTOMATIC_EOI_MODE_SET.bits());
                 };
+            let special_mask_arm = |s: &mut Self| s.command.write(OCW3::SET_SPECIAL_MASK.bits());
+            let polled_mode_arm = |s: &mut Self| {
+                s.mask_write(OCW1::all());
+                s.command.write(OCW3::POLL.bits());
             };
-            self.op_mode = new_op_mode;
+
+            match self.op_mode {
+                FullyNested => match new_op_mode {
+                    FullyNested => return,
+                    AutomaticRotation => automatic_rotation_arm(self),
+                    SpecialMask => special_mask_arm(self),
+                    PolledMode => polled_mode_arm(self),
+                },
+                AutomaticRotation => {
+                    if self.automatic_interrupts {
+                        self.command.write(OCW2::ROTATE_IN_AUTOMATIC_EOI_MODE_CLEAR.bits());
+                    }
+                    match new_op_mode {
+                        FullyNested => fully_nested_arm(self),
+                        AutomaticRotation => return,
+                        SpecialMask => special_mask_arm(self),
+                        PolledMode => polled_mode_arm(self),
+                    }
+                },
+                SpecialMask => {
+                    self.command.write(OCW3::RESET_SPECIAL_MASK.bits());
+                    match new_op_mode {
+                        FullyNested => fully_nested_arm(self),
+                        AutomaticRotation => automatic_rotation_arm(self),
+                        SpecialMask => return,
+                        PolledMode => polled_mode_arm(self)
+                    }
+                },
+                PolledMode => match new_op_mode {
+                    FullyNested => fully_nested_arm(self),
+                    AutomaticRotation => automatic_rotation_arm(self),
+                    SpecialMask => special_mask_arm(self),
+                    PolledMode => return,
+                },
+            }
         }
+        self.op_mode = new_op_mode;
     }
 
     /// Checks if the provided interrupt vector was caused by PIC properly.
@@ -232,14 +266,17 @@ impl Pic {
     /// 
     /// The interrupt status register inside the PIC chip, shows the info about which interrupts are
     /// being serviced at that moment. The value will be flushed after the end_of_interrupt method.
+    ///
+    /// # Note
+    ///
+    /// Always 0x0 in polled mode.
     pub fn read_isr(&mut self) -> ISR {
         unsafe {
-            self.command.write(OCW3::READ_REG_ISR.bits());
-            let isr = ISR::from_bits_truncate(self.command.read());
-            if self.op_mode == PicOperationMode::PolledMode {
-                self.command.write(OCW3::POLL.bits())
+            // ISR is guaranteed to be empty during in polled mode.
+            if self.op_mode == PicOperationMode::PolledMode { ISR::empty() } else {
+                self.command.write(OCW3::READ_REG_ISR.bits());
+                ISR::from_bits_truncate(self.command.read())
             }
-            isr
         }
     }
 
@@ -251,6 +288,7 @@ impl Pic {
         unsafe {
             self.command.write(OCW3::READ_REG_IRR.bits());
             let irr = IRR::from_bits_truncate(self.command.read());
+            // Polled mode will override the register read. The same goes vice-versa.
             if self.op_mode == PicOperationMode::PolledMode {
                 self.command.write(OCW3::POLL.bits())
             }
@@ -274,7 +312,7 @@ impl Pic {
     ///
     /// # Note
     ///
-    /// The interrupt is immediately acknowledged after the first read. According to the datasheet:
+    /// The interrupt is immediately acknowledged after the first read, according to the datasheet:
     /// When poll command is issued, the 8259 treats the next RD pulse as an interrupt acknowledge.
     pub fn poll(&mut self) -> Option<u8> {
         match self.op_mode {
@@ -304,22 +342,77 @@ impl Pic {
     ///
     /// # Special Mask
     ///
-    /// Before calling this function a special mask can be used with the enum to inhibit the
-    /// interrupt priority. See more info in [´PicOperationMode::SpecialMask´]
+    /// Before calling this function in a special mask mode [´PicOperationMode::SpecialMask´], a
+    /// mask can be applied to the data port of the PIC to inhibit some interrupts. Priority can
+    /// also be changed.
     ///
     /// # Note
     ///
     /// Does nothing if PIC is configured with automatic EOI flag or in poll mode.
     pub fn end_of_interrupt(&mut self) {
-        match self.op_mode {
-            PicOperationMode::FullyNested => unsafe { self.non_specified_eoi() },
-            PicOperationMode::AutomaticRotation => unsafe { self.non_specified_eoi() },
-            PicOperationMode::SpecialMask => todo!("Special mask mode"), // TODO!!
-            PicOperationMode::PolledMode => (), // Interrupt is acknowledged once the command port is read.
+        if !self.automatic_interrupts {
+            match self.op_mode {
+                PicOperationMode::AutomaticRotation => unsafe { 
+                    self.command.write(OCW2::ROTATE_ON_NON_SPECIFIC_EOI_COMMAND.bits()); 
+                },
+                PicOperationMode::PolledMode => (), // Interrupt is acknowledged once the command port is read.
+                _ => unsafe { self.non_specified_eoi() },
+            }
         }
     }
 
+    /// Sends a proper specific end of interrupt.
+    ///
+    /// # Special Mask
+    ///
+    /// Before calling this function in a special mask mode [´PicOperationMode::SpecialMask´], a
+    /// mask can be applied to the data port of the PIC to inhibit some interrupts. Priority can
+    /// also be changed.
+    ///
+    /// # Unsafe
+    ///
+    /// A proper irq must be used, or new interrupts won't appear.
+    ///
+    /// # Note
+    ///
+    /// Does nothing if PIC is configured with automatic EOI flag or in poll mode.
+    pub unsafe fn end_of_interrupt_specific(&mut self, irq: u8) {
+        assert!(irq < 8, "Level is written in binary format (0 .. 7).");
+
+        if !self.automatic_interrupts {
+            match self.op_mode {
+                PicOperationMode::AutomaticRotation => unsafe { 
+                    self.command.write(OCW2::ROTATE_ON_SPECIFIC_EOI_COMMAND.bits() | irq << OCW2::LEVEL.bits()); 
+                },
+                PicOperationMode::PolledMode => (), // Interrupt is acknowledged once the command port is read.
+                _ => unsafe { self.specified_eoi(irq) },
+            }
+        }
+    }
+
+    /// Manually change the lowest priority of this PIC.
+    ///
+    /// The lowest priority can be fixed on some IRQ and thus fixing other priorities, where lower
+    /// IRQs grow priority, i.e if the IRQ5 is lowest priority, then IRQ6 is the highest priority 
+    /// and IRQ4 is the second lowest priority (it is circular). By default in fully nested mode, 
+    /// the IRQ0 is the highest and IRQ7 is the lowest.
+    ///
+    /// The value is expected in binary format.
+    ///
+    /// # Note
+    ///
+    /// Note that PIC will generate a spurious interrupt on IRQ7 regardless of the priority level.
+    pub unsafe fn set_lowest_priority(&mut self, level: u8) {
+        assert!(level < 8, "Level is written in binary format (0 .. 7).");
+
+        self.command.write(
+            OCW2::SET_PRIORITY_COMMAND.bits() | (level << OCW2::LEVEL.bits())
+        );
+    }
+
     /// Performs an unsafe specified end of interrupt.
+    ///
+    /// The value is expected in binary format.
     ///
     /// # Unsafe 
     ///
@@ -332,6 +425,8 @@ impl Pic {
     }
 
     /// Performs an unsafe non specified end of interrupt.
+    ///
+    /// The value is expected in binary format.
     ///
     /// # Unsafe
     ///
